@@ -7,3 +7,4 @@ langchain
 fastapi
 httpx
 uvicorn
+langchain-core
