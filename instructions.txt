@@ -1,0 +1,14 @@
+The important file in this application is server.py
+
+To run this application, simply do
+
+-> uvicorn server:app --host 0.0.0.0 --port 8001
+
+-> ngrok http 8001
+
+the main.py file is for testing
+
+
+The main flow of this application.
+
+user raises Pull Request (nielguy/nielxs-dummy-flask-display-application)  -->>  github webhook  -->>  this application  -->>  mcp server application (nielguy/nielxs-mcp-server-github)  -->>  this application  -->> github webhook  -->> post comment on Pull Request
