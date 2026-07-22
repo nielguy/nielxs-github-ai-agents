@@ -33,7 +33,33 @@ MCP_SERVERS_CONFIG = {
 }
 
 producer: AIOKafkaProducer | None = None
+mcp_client: MultiServerMCPClient | None = None
+review_agent = None
 background_tasks = set()
+
+MAX_CONCURRENT_REVIEWS = 5
+REVIEW_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REVIEWS)
+
+async def get_tools_with_retry(mcp_client: MultiServerMCPClient, max_retries: int = 3):
+    """Load tools with retry logic"""
+    for attempt in range(1, max_retries + 1):
+        try:
+            tools = await asyncio.wait_for(
+                mcp_client.get_tools(),
+                timeout=15.0,
+            )
+            logger.info(f"Successfully loaded {len(tools)} tools from MCP server.")
+            return tools
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout loading tools (attempt {attempt}/{max_retries})")
+        except Exception as e:
+            logger.warning(f"Failed to load tools (attempt {attempt}/{max_retries}): {e}")
+
+        if attempt < max_retries:
+            await asyncio.sleep(2 ** attempt)
+
+    logger.error("Failed to load tools after all retries")
+    return []
 
 async def post_comment_to_github(repo: str, pr_num: int, comment: str):
     url = f"{GITHUB_API}/repos/{repo}/issues/{pr_num}/comments"
@@ -58,38 +84,29 @@ async def post_comment_to_github(repo: str, pr_num: int, comment: str):
         except httpx.RequestError as e:
             logger.error(f"Network error while communicating with GitHub API: {e}")
 
-async def run_pr_review_workflow(repo: str, pr_num: int, commit_sha: str, langchain_tools: list):
+async def run_pr_review_workflow(repo: str, pr_num: int, commit_sha: str):
     """Executes concurrently in background without blocking the consumer loop."""
-    try:
-        if not langchain_tools:
-            logger.error(f"No tools retrieved from MCP server for PR #{pr_num}")
-            return
 
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    global review_agent
 
-        system_prompt = (
-            "You are an expert Senior Security & QA Engineer. "
-            "When given a repository and PR number, you MUST FIRST use your available tools "
-            "(such as `get_pr_diff`) to retrieve the patch diff before attempting any review. "
-            "Analyze the retrieved diff for logical flaws, security vulnerabilities, or performance issues. "
-            "Provide critical feedback in a clear, concise markdown format. "
-            "If the code looks excellent, state explicitly that no issues were found."
-        )
+    if review_agent is None:
+        logger.info(f"Agent not initialized for PR {repo}#{pr_num}")
+        return
 
-        agent = create_agent(model=llm, tools=langchain_tools, system_prompt=system_prompt)
+    async with REVIEW_SEMAPHORE:
+        try:
+            user_message = (
+                f"Please fetch and review the pull request diff for repository '{repo}' "
+                f"and Pull Request #{pr_num} (commit: {commit_sha})."
+            )
 
-        user_message = (
-            f"Please fetch and review the pull request diff for repository '{repo}' "
-            f"and Pull Request #{pr_num} (commit: {commit_sha})."
-        )
+            logger.info(f"Invoking review agent loop for {repo}#{pr_num}")
+            response = await review_agent.ainvoke({"messages": [HumanMessage(content=user_message)]})
+            review_content = response["messages"][-1].content
 
-        logger.info(f"Invoking review agent loop for {repo}#{pr_num}")
-        response = await agent.ainvoke({"messages": [HumanMessage(content=user_message)]})
-        review_content = response["messages"][-1].content
-
-        await post_comment_to_github(repo, pr_num, review_content)
-    except Exception as e:
-        logger.exception(f"Unhandled error during agent execution loop for {repo}#{pr_num}: {e}")
+            await post_comment_to_github(repo, pr_num, review_content)
+        except Exception as e:
+            logger.exception(f"Unhandled error during agent execution loop for {repo}#{pr_num}: {e}")
 
 async def start_consumer_worker():
     """Background Kafka Consumer Task"""
@@ -106,16 +123,7 @@ async def start_consumer_worker():
     await kafka_consumer.start()
     logger.info(f"Consumer started for topic '{TOPIC_NAME}' (Group ID: '{CONSUMER_GROUP_ID}')")
 
-    mcp_client = MultiServerMCPClient(MCP_SERVERS_CONFIG)
-
     try:
-        try:
-            langchain_tools = await asyncio.wait_for(mcp_client.get_tools(), timeout=10.0)
-            logger.info(f"Loaded {len(langchain_tools)} tools from MCP server.")
-        except Exception as e:
-            logger.error(f"Could not load tools from MCP server on startup: {e}")
-            langchain_tools = []
-
         async for msg in kafka_consumer:
             payload = msg.value
             logger.info(f"Received message from partition {msg.partition} at offset {msg.offset}")
@@ -130,8 +138,7 @@ async def start_consumer_worker():
                         run_pr_review_workflow(
                             repo=repo_full_name,
                             pr_num=pr_number,
-                            commit_sha=commit_sha,
-                            langchain_tools=langchain_tools
+                            commit_sha=commit_sha
                         )
                     )
                     background_tasks.add(task)
@@ -150,7 +157,8 @@ async def start_consumer_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global producer
+    global producer, mcp_client, review_agent
+
     logger.info("Starting Kafka Producer...")
     producer = AIOKafkaProducer(
         bootstrap_servers=BOOTSTRAP_SERVERS,
@@ -158,6 +166,35 @@ async def lifespan(app: FastAPI):
     )
 
     await producer.start()
+
+    try:
+        logger.info("Initializing MCP Client...")
+        mcp_client = MultiServerMCPClient(MCP_SERVERS_CONFIG)
+
+        langchain_tools = await get_tools_with_retry(mcp_client=mcp_client, max_retries=3)
+        if not langchain_tools:
+            logger.error("No tools loaded. Agent will not function properly.")
+        else:
+            logger.info(f"Loaded {len(langchain_tools)} tools from MCP server.")
+
+            llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+            system_prompt = (
+                "You are an expert Senior Security & QA Engineer. "
+                "When given a repository and PR number, you MUST FIRST use your available tools "
+                "(such as `get_pr_diff`) to retrieve the patch diff before attempting any review. "
+                "Analyze the retrieved diff for logical flaws, security vulnerabilities, or performance issues. "
+                "Provide critical feedback in a clear, concise markdown format. "
+                "If the code looks excellent, state explicitly that no issues were found."
+            )
+
+            review_agent = create_agent(model=llm, tools=langchain_tools, system_prompt=system_prompt)
+
+            logger.info("Review agent created successfully and ready for reuse.")
+
+    except Exception as e:
+        logger.error(f"Failed to initialize MCP/tools/agent: {e}")
+        review_agent = None
 
     logger.info("Starting Background Consumer Task...")
     consumer_task = asyncio.create_task(start_consumer_worker())
@@ -176,8 +213,9 @@ async def lifespan(app: FastAPI):
         logger.info(f"Waiting for {len(background_tasks)} active review tasks to complete...")
         await asyncio.gather(*background_tasks, return_exceptions=True)
 
-    logger.info("Stopping Kafka Producer...")
-    await producer.stop()
+    if producer:
+        logger.info("Stopping Kafka Producer...")
+        await producer.stop()
 
 app = FastAPI(lifespan=lifespan)
 
