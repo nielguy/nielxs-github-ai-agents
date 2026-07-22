@@ -9,6 +9,23 @@ To run this application, simply do
 the main.py file is for testing
 
 
+Another way to run this application for handling more than 10000 traffics, simply do
+
+-> move to folder containing kafka
+
+-> bin/zookeeper-server-start.sh config/zookeeper.properties
+
+-> bin/kafka-server-start.sh config/server.properties
+
+-> bin.kafka-topics.sh --create --topic github-pr-reviewer --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+
+-> uv run main_app.py
+
+-> ngrok http 8001
+
+In main_app.py, I used kafka for producing the message in queue and also for consuming the message from queue
+
+
 The main flow of this application.
 
 user raises Pull Request (nielguy/nielxs-dummy-flask-display-application)  -->>  github webhook  -->>  this application  -->>  mcp server application (nielguy/nielxs-mcp-server-github)  -->>  this application  -->> github webhook  -->> post comment on Pull Request

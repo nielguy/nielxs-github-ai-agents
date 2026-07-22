@@ -8,3 +8,4 @@ fastapi
 httpx
 uvicorn
 langchain-core
+aiokafka
